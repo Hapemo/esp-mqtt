@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ESP32 GPIO Control (MQTT over WebSockets)</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; }
+      .row { margin: 8px 0; }
+      input[type="number"] { width: 80px; padding: 6px; }
+      button { padding: 8px 14px; margin-right: 8px; }
+      #log { background: #111; color: #0f0; padding: 10px; height: 220px; overflow: auto; white-space: pre-wrap; }
+      .ok { color: #0a0; }
+      .bad { color: #a00; }
+    </style>
+  </head>
+  <body>
+    <h2>ESP32 GPIO Control</h2>
+
+    <div class="row">
+      <label>Broker URL (WebSockets):</label>
+      <input id="url" style="width: 380px" placeholder="wss://<your-id>.ngrok-free.app" value="wss://<your-id>.ngrok-free.app" />
+    </div>
+    <div class="row" style="font-size: 12px; color: #555;">
+      Tip: Run ngrok on your PC: ngrok http 9001, then use the HTTPS domain shown as wss:// in this field.
+    </div>
+    <div class="row">
+      <label>Username:</label>
+      <input id="user" value="esp32user" />
+      <label style="margin-left:12px">Password:</label>
+      <input id="pass" type="password" value="esp32pass" />
+      <button id="connect">Connect</button>
+      <span id="status"></span>
+    </div>
+
+    <hr />
+
+    <div class="row">
+      <label>GPIO:</label>
+      <input id="pin" type="number" min="0" max="39" value="2" />
+      <button id="on">ON</button>
+      <button id="off">OFF</button>
+    </div>
+
+    <div class="row">
+      <button id="subscribe">Subscribe to feedback (/esp/message)</button>
+      <button id="subscribeAll">Subscribe to all (/esp/#)</button>
+    </div>
+
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <script>
+      const log = (m, cls) => {
+        const el = document.getElementById('log');
+        const line = document.createElement('div');
+        if (cls) line.className = cls;
+        line.textContent = m;
+        el.appendChild(line);
+        el.scrollTop = el.scrollHeight;
+      };
+
+      let client = null;
+      const statusEl = document.getElementById('status');
+
+      function setStatus(text, good) {
+        statusEl.textContent = text;
+        statusEl.className = good ? 'ok' : 'bad';
+      }
+
+      // Load saved settings
+      (function restoreSaved(){
+        try {
+          const saved = JSON.parse(localStorage.getItem('mqttCfg')||'{}');
+          if (saved.url) document.getElementById('url').value = saved.url;
+          if (saved.user) document.getElementById('user').value = saved.user;
+          if (saved.pass) document.getElementById('pass').value = saved.pass;
+        } catch {}
+      })();
+
+      document.getElementById('connect').onclick = () => {
+        const url = document.getElementById('url').value.trim();
+        const username = document.getElementById('user').value.trim();
+        const password = document.getElementById('pass').value;
+
+        if (client) try { client.end(true); } catch(e) {}
+
+        const options = {
+          protocolVersion: 5,
+          clean: true,
+          reconnectPeriod: 2000,
+          keepalive: 60,
+          clientId: 'web_' + Math.random().toString(16).slice(2)
+        };
+        if (username) { options.username = username; options.password = password; }
+
+        // Save settings
+        try { localStorage.setItem('mqttCfg', JSON.stringify({ url, user: username, pass: password })); } catch {}
+
+        log(`Connecting to ${url} ...`);
+        client = mqtt.connect(url, options);
+
+        client.on('connect', (pkt) => {
+          setStatus('Connected', true);
+          log('Connected (MQTT v' + pkt.protocolVersion + ')', 'ok');
+        });
+        client.on('reconnect', () => { setStatus('Reconnecting...', false); log('Reconnecting...'); });
+        client.on('error', (err) => { setStatus('Error', false); log('Error: ' + err.message, 'bad'); });
+        client.on('close', () => { setStatus('Disconnected', false); log('Disconnected'); });
+        client.on('message', (topic, payload, packet) => {
+          log(`<- ${topic}  ${payload.toString()}`);
+        });
+      };
+
+      function publishGpio(on) {
+        if (!client || client.connected !== true) {
+          log('Not connected', 'bad'); return;
+        }
+        const pin = document.getElementById('pin').value.trim();
+        const pinNum = Number(pin);
+        if (!Number.isInteger(pinNum) || pinNum < 0 || pinNum > 39) {
+          log('Invalid GPIO number', 'bad'); return;
+        }
+        // Your ESP32 code subscribes to /esp/gpio/# and:
+        // - Parses payload as the GPIO number
+        // - Detects ON/OFF in the TOPIC
+        const topic = `/esp/gpio/${pinNum}/${on ? 'ON' : 'OFF'}`;
+        const payload = String(pinNum);
+        client.publish(topic, payload, { qos: 0, retain: false }, (err) => {
+          if (err) log('Publish error: ' + err.message, 'bad');
+          else log(`-> ${topic}  ${payload}`);
+        });
+      }
+
+      document.getElementById('on').onclick  = () => publishGpio(true);
+      document.getElementById('off').onclick = () => publishGpio(false);
+
+      document.getElementById('subscribe').onclick = () => {
+        if (!client || client.connected !== true) { log('Not connected', 'bad'); return; }
+        client.subscribe('/esp/message', { qos: 0 }, (err, granted) => {
+          if (err) log('Subscribe error: ' + err.message, 'bad');
+          else log('Subscribed: ' + JSON.stringify(granted), 'ok');
+        });
+      };
+      document.getElementById('subscribeAll').onclick = () => {
+        if (!client || client.connected !== true) { log('Not connected', 'bad'); return; }
+        client.subscribe('/esp/#', { qos: 0 }, (err, granted) => {
+          if (err) log('Subscribe error: ' + err.message, 'bad');
+          else log('Subscribed: ' + JSON.stringify(granted), 'ok');
+        });
+      };
+    </script>
+  </body>
+</html>
