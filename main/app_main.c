@@ -28,6 +28,22 @@
 
 static const char *TAG = "mqtt5_example";
 
+//=============== Configuration Macros ============== //
+#define CLEAR_WIFI_CREDENTIALS_ON_BOOT 0
+
+
+//============== Global Variables ============== //
+static EventGroupHandle_t s_wifi_event_group;
+
+// user login properties
+static esp_mqtt5_user_property_item_t user_property_arr[] = {
+        {"board", "esp32"},
+        {"u", "esp32user"},
+        {"p", "esp32pass"}
+    };
+#define USE_PROPERTY_ARR_SIZE   sizeof(user_property_arr)/sizeof(esp_mqtt5_user_property_item_t)
+
+
 /* Broker URI - can also be provisioned if needed */
 #ifndef BROKER_URI
 #define BROKER_URI "mqtt://213.35.102.82:1883"
@@ -41,7 +57,6 @@ static const char *TAG = "mqtt5_example";
 #define PROV_SEC2_PWD      "abcd1234"  // Change this or use NULL for no security
 
 /* Wi-Fi connection event group */
-static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
@@ -50,199 +65,123 @@ static int s_wifi_retry_num = 0;
 
 static bool s_provisioned = false;
 
-/* Event handler for Wi-Fi provisioning */
-static void prov_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
+
+//============== Helper Functions ============== */
+
+/* URL decode helper function - converts %XX to ASCII and + to space */
+static void url_decode(char *str) {
+    char *dst = str;
+    char *src = str;
+    char hex[3] = {0};
+    
+    while (*src) {
+        if (*src == '%' && src[1] && src[2]) {
+            hex[0] = src[1];
+            hex[1] = src[2];
+            hex[2] = '\0';
+            *dst++ = (char)strtol(hex, NULL, 16);
+            src += 3;
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
+
+/* Get unique device service name for BLE provisioning */
+static void get_device_service_name(char *service_name, size_t max)
 {
-    if (event_base == WIFI_PROV_EVENT) {
-        switch (event_id) {
-            case WIFI_PROV_START:
-                ESP_LOGI(TAG, "Provisioning started");
-                break;
-            case WIFI_PROV_CRED_RECV: {
-                wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
-                ESP_LOGI(TAG, "Received Wi-Fi credentials: SSID:%s", (const char *) wifi_sta_cfg->ssid);
-                break;
-            }
-            case WIFI_PROV_CRED_FAIL: {
-                wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t *)event_data;
-                ESP_LOGE(TAG, "Provisioning failed! Reason: %s",
-                         (*reason == WIFI_PROV_STA_AUTH_ERROR) ? "Auth failed" : "AP not found");
-                break;
-            }
-            case WIFI_PROV_CRED_SUCCESS:
-                ESP_LOGI(TAG, "Provisioning successful");
-                s_provisioned = true;
-                break;
-            case WIFI_PROV_END:
-                ESP_LOGI(TAG, "Provisioning ended");
-                wifi_prov_mgr_deinit();
-                break;
-            default:
-                break;
+    uint8_t eth_mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
+    snprintf(service_name, max, "ESP32_%02X%02X%02X",
+             eth_mac[3], eth_mac[4], eth_mac[5]);
+}
+
+// Finds needle string in haystack string
+static bool span_contains(const char *hay, size_t hay_len,
+                          const char *needle, size_t needle_len)
+{
+    ESP_LOGI(TAG, "Searching for needle in haystack, Haystack: %.*s, Needle: %.*s", hay_len, hay, needle_len, needle);
+    if (needle_len == 0 || hay_len < needle_len) {
+        return false;
+    }
+    for (size_t i = 0; i + needle_len <= hay_len; ++i) {
+        if (memcmp(hay + i, needle, needle_len) == 0) {
+            return true;
         }
-    } else if (event_base == WIFI_EVENT) {
-        switch (event_id) {
-            case WIFI_EVENT_STA_START:
-                ESP_LOGI(TAG, "Wi-Fi STA started, attempting connection...");
-                esp_wifi_connect();
-                break;
-            case WIFI_EVENT_STA_DISCONNECTED:
-                wifi_event_sta_disconnected_t *disconn_evt = (wifi_event_sta_disconnected_t *)event_data;
-                ESP_LOGW(TAG, "Disconnected from AP. Reason: %d", disconn_evt->reason);
-                
-                if (s_wifi_retry_num < MAX_WIFI_RETRY) {
-                    esp_wifi_connect();
-                    s_wifi_retry_num++;
-                    ESP_LOGI(TAG, "Retry %d/%d to connect to AP", s_wifi_retry_num, MAX_WIFI_RETRY);
-                } else {
-                    ESP_LOGE(TAG, "Failed to connect after %d attempts", MAX_WIFI_RETRY);
-                    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-                }
-                break;
-            default:
-                break;
-        }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        s_wifi_retry_num = 0;  // Reset retry counter on successful connection
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+    return false;
+}
+
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+    if (error_code != 0) {
+        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
     }
 }
 
-/* ============== Custom Web UI for Provisioning ============== */
+// Print user properties from received messages, such as CONNACK, PUBLISH, SUBACK, etc.
+static void print_user_property(mqtt5_user_property_handle_t user_property) {
+    if (user_property) {
+        uint8_t count = esp_mqtt5_client_get_user_property_count(user_property);
+        if (count) {
+            esp_mqtt5_user_property_item_t *item = malloc(count * sizeof(esp_mqtt5_user_property_item_t));
+            if (esp_mqtt5_client_get_user_property(user_property, item, &count) == ESP_OK) {
+                for (int i = 0; i < count; i ++) {
+                    esp_mqtt5_user_property_item_t *t = &item[i];
+                    ESP_LOGI(TAG, "key is %s, value is %s", t->key, t->value);
+                    free((char *)t->key);
+                    free((char *)t->value);
+                }
+            }
+            free(item);
+        }
+    }
+}
 
+// Send a PUBLISH mqtt message with user properties
+static void send_a_message(esp_mqtt_client_handle_t client, const char *message) {
+    esp_mqtt5_publish_property_config_t temp_publish_property = {
+        .payload_format_indicator = 1,
+        .message_expiry_interval = 1000,
+        .topic_alias = 0,
+        .response_topic = "/esp/response",
+        .correlation_data = "This is correlation data",
+        .correlation_data_len = 24,
+    };
+    esp_mqtt5_client_set_user_property(&temp_publish_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
+    esp_mqtt5_client_set_publish_property(client, &temp_publish_property);
+    int msg_id = esp_mqtt_client_publish(client, "/esp/message", message, 0, 1, 1);
+    ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+    esp_mqtt5_client_delete_user_property(temp_publish_property.user_property);
+}
+
+//============== End Helper Functions ============== */
+
+/* ============== Custom Web UI for Provisioning ============== */
+// This portion implements a simple HTML page served over HTTP for Wi-Fi provisioning.
+// It specifies the 3 main handlers: root page, scan networks, and connect to Wi-Fi.
+// An unique uri is created for each of these situations and handler functions are defined accordingly.
+// The HTML page will contain buttons and forms, which will trigger HTTP requests to the server for scanning and connection.
+// Once connected, the server will respond with success or failure messages, then instruct the esp to restart.
 static httpd_handle_t server = NULL;
 
-/* Embedded HTML page for Wi-Fi provisioning */
-static const char html_page[] =
-"<!DOCTYPE html>\n"
-"<html>\n"
-"<head>\n"
-"    <meta charset=\"UTF-8\">\n"
-"    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-"    <title>ESP32 Wi-Fi Setup</title>\n"
-"    <style>\n"
-"        * { margin: 0; padding: 0; box-sizing: border-box; }\n"
-"        body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); \n"
-"               display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; }\n"
-"        .container { background: white; border-radius: 20px; padding: 40px; max-width: 450px; width: 100%; \n"
-"                     box-shadow: 0 20px 60px rgba(0,0,0,0.3); }\n"
-"        h1 { color: #333; text-align: center; margin-bottom: 10px; font-size: 28px; }\n"
-"        .subtitle { text-align: center; color: #666; margin-bottom: 30px; font-size: 14px; }\n"
-"        .form-group { margin-bottom: 25px; }\n"
-"        label { display: block; margin-bottom: 8px; color: #555; font-weight: 600; font-size: 14px; }\n"
-"        input, select { width: 100%; padding: 12px 15px; border: 2px solid #e0e0e0; border-radius: 10px; \n"
-"                       font-size: 15px; transition: all 0.3s; }\n"
-"        input:focus, select:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1); }\n"
-"        button { width: 100%; padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); \n"
-"                color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; \n"
-"                cursor: pointer; transition: transform 0.2s; }\n"
-"        button:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102,126,234,0.4); }\n"
-"        button:active { transform: translateY(0); }\n"
-"        .refresh-btn { background: #4CAF50; margin-bottom: 20px; padding: 10px; }\n"
-"        .status { padding: 15px; border-radius: 10px; margin-top: 20px; text-align: center; display: none; }\n"
-"        .status.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; display: block; }\n"
-"        .status.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; display: block; }\n"
-"        .loader { border: 3px solid #f3f3f3; border-top: 3px solid #667eea; border-radius: 50%; \n"
-"                 width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 20px auto; display: none; }\n"
-"        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }\n"
-"    </style>\n"
-"</head>\n"
-"<body>\n"
-"    <div class=\"container\">\n"
-"        <h1>🛜 ESP32 Wi-Fi Setup</h1>\n"
-"        <p class=\"subtitle\">Configure your device's network connection</p>\n"
-"        \n"
-"        <button class=\"refresh-btn\" onclick=\"scanNetworks()\">🔄 Scan Networks</button>\n"
-"        \n"
-"        <form id=\"wifiForm\" onsubmit=\"submitForm(event)\">\n"
-"            <div class=\"form-group\">\n"
-"                <label for=\"ssid\">Wi-Fi Network (SSID)</label>\n"
-"                <select id=\"ssid\" name=\"ssid\" required>\n"
-"                    <option value=\"\">Scanning...</option>\n"
-"                </select>\n"
-"            </div>\n"
-"            \n"
-"            <div class=\"form-group\">\n"
-"                <label for=\"password\">Wi-Fi Password</label>\n"
-"                <input type=\"password\" id=\"password\" name=\"password\" placeholder=\"Enter password\" required>\n"
-"            </div>\n"
-"            \n"
-"            <button type=\"submit\">Connect to Wi-Fi</button>\n"
-"        </form>\n"
-"        \n"
-"        <div class=\"loader\" id=\"loader\"></div>\n"
-"        <div class=\"status\" id=\"status\"></div>\n"
-"    </div>\n"
-"    \n"
-"    <script>\n"
-"        function scanNetworks() {\n"
-"            document.getElementById('loader').style.display = 'block';\n"
-"            fetch('/scan').then(r => r.json()).then(data => {\n"
-"                const select = document.getElementById('ssid');\n"
-"                select.innerHTML = '<option value=\"\">Select network...</option>';\n"
-"                data.networks.forEach(net => {\n"
-"                    const opt = document.createElement('option');\n"
-"                    opt.value = net.ssid;\n"
-"                    opt.textContent = net.ssid + ' (' + net.rssi + ' dBm)';\n"
-"                    select.appendChild(opt);\n"
-"                });\n"
-"                document.getElementById('loader').style.display = 'none';\n"
-"            }).catch(() => {\n"
-"                document.getElementById('loader').style.display = 'none';\n"
-"                showStatus('Scan failed', 'error');\n"
-"            });\n"
-"        }\n"
-"        \n"
-"        function submitForm(e) {\n"
-"            e.preventDefault();\n"
-"            document.getElementById('loader').style.display = 'block';\n"
-"            const ssid = document.getElementById('ssid').value;\n"
-"            const password = document.getElementById('password').value;\n"
-"            \n"
-"            fetch('/connect', {\n"
-"                method: 'POST',\n"
-"                headers: {'Content-Type': 'application/x-www-form-urlencoded'},\n"
-"                body: 'ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(password)\n"
-"            }).then(r => r.json()).then(data => {\n"
-"                document.getElementById('loader').style.display = 'none';\n"
-"                if(data.success) {\n"
-"                    showStatus('✅ Connected! Device will restart...', 'success');\n"
-"                    setTimeout(() => { window.location.reload(); }, 3000);\n"
-"                } else {\n"
-"                    showStatus('❌ Connection failed: ' + data.message, 'error');\n"
-"                }\n"
-"            }).catch(() => {\n"
-"                document.getElementById('loader').style.display = 'none';\n"
-"                showStatus('❌ Request failed', 'error');\n"
-"            });\n"
-"        }\n"
-"        \n"
-"        function showStatus(msg, type) {\n"
-"            const status = document.getElementById('status');\n"
-"            status.textContent = msg;\n"
-"            status.className = 'status ' + type;\n"
-"        }\n"
-"        \n"
-"        window.onload = () => scanNetworks();\n"
-"    </script>\n"
-"</body>\n"
-"</html>\n";
+// HTML page for Wi-Fi provisioning is embedded from a separate file at build-time.
+#include "embedded_html.h"
 
-
-/* HTTP GET handler for root */
-static esp_err_t root_get_handler(httpd_req_t *req)
-{
+/* HTTP GET handler for root, the main page HTML, served over HTTP */
+static esp_err_t root_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
-/* HTTP GET handler for Wi-Fi scan */
-static esp_err_t scan_get_handler(httpd_req_t *req)
-{
+/* HTTP GET handler for Wi-Fi scan, returns a list of available networks */
+static esp_err_t scan_get_handler(httpd_req_t *req) {
     wifi_scan_config_t scan_config = {
         .show_hidden = false,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE
@@ -286,33 +225,8 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* URL decode helper function - converts %XX to ASCII and + to space */
-static void url_decode(char *str)
-{
-    char *dst = str;
-    char *src = str;
-    char hex[3] = {0};
-    
-    while (*src) {
-        if (*src == '%' && src[1] && src[2]) {
-            hex[0] = src[1];
-            hex[1] = src[2];
-            hex[2] = '\0';
-            *dst++ = (char)strtol(hex, NULL, 16);
-            src += 3;
-        } else if (*src == '+') {
-            *dst++ = ' ';
-            src++;
-        } else {
-            *dst++ = *src++;
-        }
-    }
-    *dst = '\0';
-}
-
 /* HTTP POST handler for Wi-Fi connection */
-static esp_err_t connect_post_handler(httpd_req_t *req)
-{
+static esp_err_t connect_post_handler(httpd_req_t *req) {
     char buf[200];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret <= 0) {
@@ -383,7 +297,7 @@ static esp_err_t connect_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* Start custom web server */
+/* Start custom web server, this is for wifi provisioning*/
 static void start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -418,35 +332,73 @@ static void start_webserver(void)
 
 /* ============== End Custom Web UI ============== */
 
-/* Get unique device service name for BLE provisioning */
-static void get_device_service_name(char *service_name, size_t max)
-{
-    uint8_t eth_mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
-    snprintf(service_name, max, "ESP32_%02X%02X%02X",
-             eth_mac[3], eth_mac[4], eth_mac[5]);
-}
 
-// Finds needle string in haystack string
-static bool span_contains(const char *hay, size_t hay_len,
-                          const char *needle, size_t needle_len)
-{
-    ESP_LOGI(TAG, "Searching for needle in haystack, Haystack: %.*s, Needle: %.*s", hay_len, hay, needle_len, needle);
-    if (needle_len == 0 || hay_len < needle_len) {
-        return false;
-    }
-    for (size_t i = 0; i + needle_len <= hay_len; ++i) {
-        if (memcmp(hay + i, needle, needle_len) == 0) {
-            return true;
+
+//============== Wi-Fi Initialization and Event Handling ==============
+
+/* Event handler for Wi-Fi provisioning */
+// This function handles events from both the provisioning manager and the Wi-Fi driver.
+// It processes events such as provisioning start, receiving credentials, connection success/failure, and IP acquisition.
+static void prov_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    if (event_base == WIFI_PROV_EVENT) {
+        switch (event_id) {
+            case WIFI_PROV_START:
+                ESP_LOGI(TAG, "Provisioning started");
+                break;
+            case WIFI_PROV_CRED_RECV: {
+                wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
+                ESP_LOGI(TAG, "Received Wi-Fi credentials: SSID:%s", (const char *) wifi_sta_cfg->ssid);
+                break;
+            }
+            case WIFI_PROV_CRED_FAIL: {
+                wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t *)event_data;
+                ESP_LOGE(TAG, "Provisioning failed! Reason: %s",
+                         (*reason == WIFI_PROV_STA_AUTH_ERROR) ? "Auth failed" : "AP not found");
+                break;
+            }
+            case WIFI_PROV_CRED_SUCCESS:
+                ESP_LOGI(TAG, "Provisioning successful");
+                s_provisioned = true;
+                break;
+            case WIFI_PROV_END:
+                ESP_LOGI(TAG, "Provisioning ended");
+                wifi_prov_mgr_deinit();
+                break;
+            default:
+                break;
         }
+    } else if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "Wi-Fi STA started, attempting connection...");
+                esp_wifi_connect();
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                wifi_event_sta_disconnected_t *disconn_evt = (wifi_event_sta_disconnected_t *)event_data;
+                ESP_LOGW(TAG, "Disconnected from AP. Reason: %d", disconn_evt->reason);
+                
+                if (s_wifi_retry_num < MAX_WIFI_RETRY) {
+                    esp_wifi_connect();
+                    s_wifi_retry_num++;
+                    ESP_LOGI(TAG, "Retry %d/%d to connect to AP", s_wifi_retry_num, MAX_WIFI_RETRY);
+                } else {
+                    ESP_LOGE(TAG, "Failed to connect after %d attempts", MAX_WIFI_RETRY);
+                    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+                }
+                break;
+            default:
+                break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_retry_num = 0;  // Reset retry counter on successful connection
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
-    return false;
 }
 
-
-/* Initialize Wi-Fi with provisioning manager */
-static void wifi_init_with_provisioning(void)
-{
+/* Initialize Wi-Fi with provisioning manager, it will check NVS for existing credentials first before provisioning*/
+static void InitWiFi(void) {
     s_wifi_event_group = xEventGroupCreate();
     
     /* Initialize TCP/IP */
@@ -454,18 +406,18 @@ static void wifi_init_with_provisioning(void)
     
     /* Initialize event loop if not already done */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    /* Create default STA network interface */
+
+    /* Create default STA network interface, this is require for connection to Wi-Fi networks */
     esp_netif_create_default_wifi_sta();
-    
-    /* Create default AP network interface for SoftAP provisioning */
+
+    /* Create default AP network interface for SoftAP provisioning, this is require for creating a Wi-Fi access point*/
     esp_netif_create_default_wifi_ap();
 
     /* Initialize Wi-Fi */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    /* Register event handlers */
+    /* Register event handlers, this is require for handling Wi-Fi events*/
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &prov_event_handler, NULL));
 
@@ -516,12 +468,8 @@ static void wifi_init_with_provisioning(void)
         sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;  // Accept any security (open to WPA3)
         sta_cfg.sta.channel = 0;  // Scan all channels
         sta_cfg.sta.bssid_set = 0;  // Don't lock to specific BSSID
-        
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
-        ESP_ERROR_CHECK(esp_wifi_start());
-        
-        /* Do a manual scan to verify the AP is visible */
+
+        /* Do a manual scan to verify the AP is visible, sanity check*/
         ESP_LOGI(TAG, "Scanning for AP: %s", sta_cfg.sta.ssid);
         wifi_scan_config_t scan_config = {
             .ssid = sta_cfg.sta.ssid,
@@ -547,142 +495,73 @@ static void wifi_init_with_provisioning(void)
                 ESP_LOGW(TAG, "AP not found in scan! Check SSID spelling and phone hotspot is active");
             }
         }
+        
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+        ESP_ERROR_CHECK(esp_wifi_start());
     }
 }
 
-/* Reset button task - hold button to clear credentials and re-provision */
-static void reset_button_task(void *pvParameters)
-{
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << RESET_BUTTON_GPIO),
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_ENABLE
-    };
-    gpio_config(&io_conf);
+// ============== End Wi-Fi Initialization and Event Handling ============== */
 
-    uint32_t press_count = 0;
-    const uint32_t RESET_THRESHOLD = 50; // Hold for 5 seconds (50 * 100ms)
-
-    while (1) {
-        if (gpio_get_level(RESET_BUTTON_GPIO) == 0) {  // Button pressed (active low)
-            press_count++;
-            if (press_count >= RESET_THRESHOLD) {
-                ESP_LOGW(TAG, "Reset button held - clearing credentials and restarting...");
-                
-                /* Clear NVS and restart */
-                nvs_flash_erase();
-                esp_restart();
-            }
-        } else {
-            press_count = 0;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
-static void log_error_if_nonzero(const char *message, int error_code)
-{
-    if (error_code != 0) {
-        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
-    }
-}
-
-static esp_mqtt5_user_property_item_t user_property_arr[] = {
-        {"board", "esp32"},
-        {"u", "esp32user"},
-        {"p", "esp32pass"}
-    };
-
-#define USE_PROPERTY_ARR_SIZE   sizeof(user_property_arr)/sizeof(esp_mqtt5_user_property_item_t)
-
-static esp_mqtt5_publish_property_config_t publish_property = {
-    .payload_format_indicator = 1,
-    .message_expiry_interval = 1000,
-    .topic_alias = 0,
-    .response_topic = "/topic/test/response",
-    .correlation_data = "123456",
-    .correlation_data_len = 6,
-};
-
-static esp_mqtt5_subscribe_property_config_t subscribe_property = {
-    .subscribe_id = 25555,
-    .no_local_flag = false,
-    .retain_as_published_flag = false,
-    .retain_handle = 0,
-    .is_share_subscribe = true,
-    .share_name = "group1",
-};
-
-static esp_mqtt5_subscribe_property_config_t subscribe1_property = {
-    .subscribe_id = 25555,
-    .no_local_flag = true,
-    .retain_as_published_flag = false,
-    .retain_handle = 0,
-};
-
-static esp_mqtt5_unsubscribe_property_config_t unsubscribe_property = {
-    .is_share_subscribe = true,
-    .share_name = "group1",
-};
-
-static esp_mqtt5_disconnect_property_config_t disconnect_property = {
-    .session_expiry_interval = 60,
-    .disconnect_reason = 0,
-};
-
-static void print_user_property(mqtt5_user_property_handle_t user_property)
-{
-    if (user_property) {
-        uint8_t count = esp_mqtt5_client_get_user_property_count(user_property);
-        if (count) {
-            esp_mqtt5_user_property_item_t *item = malloc(count * sizeof(esp_mqtt5_user_property_item_t));
-            if (esp_mqtt5_client_get_user_property(user_property, item, &count) == ESP_OK) {
-                for (int i = 0; i < count; i ++) {
-                    esp_mqtt5_user_property_item_t *t = &item[i];
-                    ESP_LOGI(TAG, "key is %s, value is %s", t->key, t->value);
-                    free((char *)t->key);
-                    free((char *)t->value);
-                }
-            }
-            free(item);
-        }
-    }
-}
-
-static void send_a_message(esp_mqtt_client_handle_t client, const char *message) {
-    esp_mqtt5_publish_property_config_t temp_publish_property = {
-        .payload_format_indicator = 1,
-        .message_expiry_interval = 1000,
-        .topic_alias = 0,
-        .response_topic = "/esp/response",
-        .correlation_data = "This is correlation data",
-        .correlation_data_len = 24,
-    };
-    esp_mqtt5_client_set_user_property(&temp_publish_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
-    esp_mqtt5_client_set_publish_property(client, &temp_publish_property);
-    int msg_id = esp_mqtt_client_publish(client, "/esp/message", message, 0, 1, 1);
-    ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
-    esp_mqtt5_client_delete_user_property(temp_publish_property.user_property);
-}
+// ============== MQTT 5 Operations ==============
 
 /*
  * @brief Event handler registered to receive MQTT events
  *
  *  This function is called by the MQTT client event loop.
+ *  It handles different MQTT events such as connection, disconnection, 
+ *  subscription, publication, and data reception. When connected, it
+ *  sets various MQTT 5 properties and performs publish and subscribe operations.
+ *  When data is received, it prints the topic and message payload. 
+ *  If the topic contains "/esp/gpio/", it toggles the corresponding GPIO pin.
  *
  * @param handler_args user data registered to the event.
  * @param base Event base for the handler(always MQTT Base in this example).
  * @param event_id The id for the received event.
  * @param event_data The data for the event, esp_mqtt_event_handle_t.
  */
-static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
-{
+static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32, base, event_id);
     esp_mqtt_event_handle_t event = event_data;
     esp_mqtt_client_handle_t client = event->client;
     int msg_id;
+
+    // Define MQTT 5 properties for various operations
+    static esp_mqtt5_publish_property_config_t publish_property = {
+        .payload_format_indicator = 1,
+        .message_expiry_interval = 1000,
+        .topic_alias = 0,
+        .response_topic = "/topic/test/response",
+        .correlation_data = "123456",
+        .correlation_data_len = 6,
+    };
+
+    static esp_mqtt5_subscribe_property_config_t subscribe_property = {
+        .subscribe_id = 25555,
+        .no_local_flag = false,
+        .retain_as_published_flag = false,
+        .retain_handle = 0,
+        .is_share_subscribe = true,
+        .share_name = "group1",
+    };
+
+    static esp_mqtt5_subscribe_property_config_t subscribe1_property = {
+        .subscribe_id = 25555,
+        .no_local_flag = true,
+        .retain_as_published_flag = false,
+        .retain_handle = 0,
+    };
+
+    static esp_mqtt5_unsubscribe_property_config_t unsubscribe_property = {
+        .is_share_subscribe = true,
+        .share_name = "group1",
+    };
+
+    static esp_mqtt5_disconnect_property_config_t disconnect_property = {
+        .session_expiry_interval = 60,
+        .disconnect_reason = 0,
+    };
 
     ESP_LOGD(TAG, "free heap size is %" PRIu32 ", minimum %" PRIu32, esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     switch ((esp_mqtt_event_id_t)event_id) {
@@ -837,9 +716,10 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
     }
 }
 
-
-static void mqtt5_app_start(void)
-{
+// This function starts the MQTT client with MQTT 5 settings and properties
+// It initializes the client, sets connection properties including user properties,
+// registers the event handler (using mqtt5_event_handler()), and starts the client.
+static void mqtt5_app_start(void) {
     esp_mqtt5_connection_property_config_t connect_property = {
         .session_expiry_interval = 10,
         .maximum_packet_size = 1024,
@@ -886,8 +766,12 @@ static void mqtt5_app_start(void)
     esp_mqtt_client_start(client);
 }
 
-void app_main(void)
-{
+//============== End MQTT 5 Operations ============== */
+
+
+//============== Other Misc Operations ==============
+// Initialize logging system and set log levels
+static void InitLogs() {
     ESP_LOGI(TAG, "[APP] Startup..");
     ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
     ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
@@ -899,8 +783,41 @@ void app_main(void)
     esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
     esp_log_level_set("transport", ESP_LOG_VERBOSE);
     esp_log_level_set("outbox", ESP_LOG_VERBOSE);
+}
 
-    /* Initialize NVS for storing credentials */
+/* Reset button task - hold button for 5 seconds to clear credentials and re-provision */
+static void reset_button_task(void *pvParameters) {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << RESET_BUTTON_GPIO),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE
+    };
+    gpio_config(&io_conf);
+
+    uint32_t press_count = 0;
+    const uint32_t RESET_THRESHOLD = 50; // Hold for 5 seconds (50 * 100ms)
+
+    while (1) {
+        if (gpio_get_level(RESET_BUTTON_GPIO) == 0) {  // Button pressed (active low)
+            press_count++;
+            if (press_count >= RESET_THRESHOLD) {
+                ESP_LOGW(TAG, "Reset button held - clearing credentials and restarting...");
+                
+                /* Clear NVS and restart */
+                nvs_flash_erase();
+                esp_restart();
+            }
+        } else {
+            press_count = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// Initialize NVS and optionally clear Wi-Fi credentials on boot
+void InitNVS() {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -909,20 +826,29 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     /* Automatically clear Wi-Fi credentials on every boot */
-    ESP_LOGI(TAG, "Clearing stored Wi-Fi credentials...");
-    nvs_handle_t nvs_handle;
-    ret = nvs_open("nvs.net80211", NVS_READWRITE, &nvs_handle);
-    if (ret == ESP_OK) {
-        // nvs_erase_all(nvs_handle);
-        // nvs_commit(nvs_handle);
-        // nvs_close(nvs_handle);
-        // ESP_LOGI(TAG, "Wi-Fi credentials cleared from NVS");
-    } else {
-        ESP_LOGW(TAG, "Could not open NVS namespace for Wi-Fi credentials");
+    if (CLEAR_WIFI_CREDENTIALS_ON_BOOT) {
+        ESP_LOGI(TAG, "Clearing stored Wi-Fi credentials...");
+        nvs_handle_t nvs_handle;
+        ret = nvs_open("nvs.net80211", NVS_READWRITE, &nvs_handle);
+        if (ret == ESP_OK) {
+            // nvs_erase_all(nvs_handle);
+            // nvs_commit(nvs_handle);
+            // nvs_close(nvs_handle);
+            // ESP_LOGI(TAG, "Wi-Fi credentials cleared from NVS");
+        } else {
+            ESP_LOGW(TAG, "Could not open NVS namespace for Wi-Fi credentials");
+        }
     }
+}
 
-    /* Initialize Wi-Fi with provisioning (will check NVS for existing credentials) */
-    wifi_init_with_provisioning();
+//============== End Other Misc Operations ==============
+
+
+void app_main(void)
+{
+    InitLogs();
+    InitNVS();
+    InitWiFi();
 
     /* Start reset button monitor task */
     xTaskCreate(reset_button_task, "reset_button", 2048, NULL, 5, NULL);
