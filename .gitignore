@@ -1,0 +1,4 @@
+/.clangd
+/.devcontainer
+/.vscode
+/build
