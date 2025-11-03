@@ -1196,6 +1196,12 @@ CONFIG_ESP_INTR_IN_IRAM=y
 # end of Hardware Settings
 
 #
+# ESP-Driver:LCD Controller Configurations
+#
+# CONFIG_LCD_ENABLE_DEBUG_LOG is not set
+# end of ESP-Driver:LCD Controller Configurations
+
+#
 # ESP-MM: Memory Management Configurations
 #
 # end of ESP-MM: Memory Management Configurations
@@ -1248,6 +1254,12 @@ CONFIG_PM_SLEEP_FUNC_IN_IRAM=y
 # CONFIG_PM_ENABLE is not set
 CONFIG_PM_SLP_IRAM_OPT=y
 # end of Power Management
+
+#
+# ESP PSRAM
+#
+# CONFIG_SPIRAM is not set
+# end of ESP PSRAM
 
 #
 # ESP Ringbuf
@@ -2379,6 +2391,8 @@ CONFIG_ESP32_PHY_MAX_WIFI_TX_POWER=20
 CONFIG_ESP32_PHY_MAX_TX_POWER=20
 # CONFIG_REDUCE_PHY_TX_POWER is not set
 # CONFIG_ESP32_REDUCE_PHY_TX_POWER is not set
+# CONFIG_SPIRAM_SUPPORT is not set
+# CONFIG_ESP32_SPIRAM_SUPPORT is not set
 # CONFIG_ESP32_DEFAULT_CPU_FREQ_80 is not set
 CONFIG_ESP32_DEFAULT_CPU_FREQ_160=y
 # CONFIG_ESP32_DEFAULT_CPU_FREQ_240 is not set

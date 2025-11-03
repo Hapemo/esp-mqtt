@@ -13,6 +13,38 @@ It uses ESP-MQTT library which implements mqtt client to connect to mqtt broker 
 
 The more details about MQTT v5, please refer to [official website](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
 
+## Optional: OLED status display (SSD1306 over I2C)
+
+You can connect a small I2C OLED (SSD1306 128x64) to mirror key logs (Wi‑Fi/MQTT status and last message line).
+
+Wiring (defaults):
+
+- GND → ESP32 GND
+- VCC → ESP32 3V3
+- SDA → GPIO21
+- SCL → GPIO22
+
+Notes:
+
+- Default I2C address is 0x3C. If your module uses 0x3D, change the call to `display_init()` in `main/app_main.c` accordingly.
+- The display is initialized at startup and will show short status lines like "Booting…", "WiFi: OK", "IP x.x.x.x", "MQTT: OK", and the last received topic.
+
+Build requirements:
+
+- This project uses the managed component `chill-sam/ssd1306` for the OLED driver (fetched automatically).
+- If you see a CMake error about a missing component, run:
+
+```powershell
+idf.py reconfigure
+```
+
+If the issue persists, clear the component cache and retry:
+
+```powershell
+Remove-Item -Recurse -Force .\managed_components, .\dependencies.lock
+idf.py reconfigure
+```
+
 ## How to use example
 
 ### Hardware Required

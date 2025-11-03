@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "display_log.h"
 
 /* Wi-Fi Provisioning */
 #include <wifi_provisioning/manager.h>
@@ -344,21 +345,25 @@ static void prov_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         switch (event_id) {
             case WIFI_PROV_START:
                 ESP_LOGI(TAG, "Provisioning started");
+                display_println("Prov start");
                 break;
             case WIFI_PROV_CRED_RECV: {
                 wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
                 ESP_LOGI(TAG, "Received Wi-Fi credentials: SSID:%s", (const char *) wifi_sta_cfg->ssid);
+                display_println("Creds recv");
                 break;
             }
             case WIFI_PROV_CRED_FAIL: {
                 wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t *)event_data;
                 ESP_LOGE(TAG, "Provisioning failed! Reason: %s",
                          (*reason == WIFI_PROV_STA_AUTH_ERROR) ? "Auth failed" : "AP not found");
+                display_println("Prov failed");
                 break;
             }
             case WIFI_PROV_CRED_SUCCESS:
                 ESP_LOGI(TAG, "Provisioning successful");
                 s_provisioned = true;
+                display_println("Prov OK");
                 break;
             case WIFI_PROV_END:
                 ESP_LOGI(TAG, "Provisioning ended");
@@ -394,6 +399,9 @@ static void prov_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_wifi_retry_num = 0;  // Reset retry counter on successful connection
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        char ipbuf[16];
+        snprintf(ipbuf, sizeof(ipbuf), IPSTR, IP2STR(&event->ip_info.ip));
+        display_wifi_connected(ipbuf);
     }
 }
 
@@ -567,6 +575,7 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        display_mqtt_connected();
         print_user_property(event->property->user_property);
         esp_mqtt5_client_set_user_property(&publish_property.user_property, user_property_arr, USE_PROPERTY_ARR_SIZE);
         esp_mqtt5_client_set_publish_property(client, &publish_property);
@@ -616,6 +625,7 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        display_mqtt_disconnected();
         print_user_property(event->property->user_property);
         break;
     case MQTT_EVENT_SUBSCRIBED:
@@ -647,6 +657,12 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
         ESP_LOGI(TAG, "content_type is %.*s", event->property->content_type_len, event->property->content_type);
         ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
         ESP_LOGI(TAG, "DATA=%.*s", event->data_len, event->data);
+        {
+            char tbuf[24] = {0};
+            int tlen = event->topic_len < (int)sizeof(tbuf)-1 ? event->topic_len : (int)sizeof(tbuf)-1;
+            memcpy(tbuf, event->topic, tlen);
+            display_printf("RX %s", tbuf);
+        }
         
         // Selecting topic
         if (span_contains(event->topic, event->topic_len, "/event", 6)) {
@@ -848,6 +864,8 @@ void app_main(void)
 {
     InitLogs();
     InitNVS();
+    // Initialize OLED (defaults GPIO21 SDA, GPIO22 SCL, addr 0x3C)
+    display_init(OLED_DEFAULT_SDA, OLED_DEFAULT_SCL, OLED_DEFAULT_ADDR);
     InitWiFi();
 
     /* Start reset button monitor task */
