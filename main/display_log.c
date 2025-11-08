@@ -23,7 +23,7 @@ static i2c_master_dev_handle_t s_dev = NULL;
 
 #define MAX_LINES 4
 #define MAX_CHARS 21
-static char s_lines[MAX_LINES][MAX_CHARS + 1];
+static char s_lines[MAX_LINES][MAX_CHARS + 1]; // s_lines holds the lines to be printed.
 static int s_head = 0; // next line index to write
 static SemaphoreHandle_t s_mutex;
 static volatile bool s_dirty = false;
@@ -134,6 +134,7 @@ static inline void fb_putpix(uint8_t *fb, int x, int y) {
     fb[index] |= (1u << (y & 7));
 }
 
+// Draw character c at (x,y) in framebuffer fb
 static void fb_draw_char(uint8_t *fb, int x, int y, char c) {
     if (c < 32 || c > 127) c = '?';
     const uint8_t *cols = font6x8[c - 32];
@@ -145,6 +146,7 @@ static void fb_draw_char(uint8_t *fb, int x, int y, char c) {
     }
 }
 
+// Draw string s at (x,y) in framebuffer fb, using fb_draw_char
 static void fb_draw_str(uint8_t *fb, int x, int y, const char *s) {
     int cx = x;
     while (*s) {
@@ -160,10 +162,13 @@ static void fb_draw_str(uint8_t *fb, int x, int y, const char *s) {
 #define SH1106_COL_TOTAL 132     // SH1106 GDDRAM columns
 
 static inline void sh1106_cmd(uint8_t cmd) {
-    uint8_t buf[2] = {0x00, cmd}; // control=0x00 (command)
+    uint8_t buf[2] = {0x00, cmd}; // control=0x00 (command) It marks the next byte as a command
     (void)i2c_master_transmit(s_dev, buf, sizeof(buf), 50);
 }
 
+// Set SH1106 page and column address
+// Page is the 8-pixel high row (0..7), col is 0..127 visible area
+// One page length is used for a row of 8 vertical pixels, so you can write lines of text.
 static inline void sh1106_set_page_col(int page, int col) {
     // Set page address (0xB0..0xB7)
     sh1106_cmd(0xB0 | (page & 0x0F));
@@ -173,6 +178,7 @@ static inline void sh1106_set_page_col(int page, int col) {
     sh1106_cmd(0x00 | (c & 0x0F));           // lower col
 }
 
+// Transmit data bytes to SH1106
 static inline void sh1106_tx_data(const void *data, size_t len) {
     // Chunk data with 0x40 control prefix (data)
     const uint8_t *p = (const uint8_t *)data;
@@ -188,6 +194,7 @@ static inline void sh1106_tx_data(const void *data, size_t len) {
     }
 }
 
+// Draw full 128x64 framebuffer to SH1106 display
 static void sh1106_draw_full(const uint8_t *fb) {
     static const uint8_t zeros8[8] = {0};
     for (int page = 0; page < 8; ++page) {
@@ -195,6 +202,7 @@ static void sh1106_draw_full(const uint8_t *fb) {
         sh1106_set_page_col(page, 0);
 
         // Left margin: clear columns before visible area
+        // This is to ensure we don't have any garbage data on the display
         int left = SH1106_COL_OFFSET;
         while (left > 0) {
             size_t n = left > (int)sizeof(zeros8) ? sizeof(zeros8) : (size_t)left;
@@ -203,10 +211,12 @@ static void sh1106_draw_full(const uint8_t *fb) {
         }
 
         // Visible 128 columns from framebuffer
+        // Sends 128 bytes from fb for this page
         const uint8_t *row = &fb[page * 128];
         sh1106_tx_data(row, 128);
 
         // Right margin: clear any remaining columns to end of GDDRAM
+        // This is to ensure we don't have any garbage data on the display
         int right = SH1106_COL_TOTAL - (SH1106_COL_OFFSET + 128);
         while (right > 0) {
             size_t n = right > (int)sizeof(zeros8) ? sizeof(zeros8) : (size_t)right;
@@ -216,9 +226,10 @@ static void sh1106_draw_full(const uint8_t *fb) {
     }
 }
 
+// Draw all the lines from s_lines[] to the display
 static void draw_all(void) {
     if (!s_display_ok) return;
-    static uint8_t fb[128 * 64 / 8];
+    static uint8_t fb[128 * 64 / 8]; // framebuffer
     memset(fb, 0x00, sizeof(fb));
     for (int i = 0; i < MAX_LINES; ++i) {
         int idx = (s_head + i) % MAX_LINES;
@@ -322,6 +333,9 @@ bool display_init(int sda_gpio, int scl_gpio, int i2c_addr_7bit) {
     }
 
     // --------- SH1106 init sequence (page addressing) ---------
+    // This is to initialize the SH1106 controller in page addressing mode.
+    // The register on the oled panel might not be aligned with what we have in the driver.
+    // So we sync all the settings here before using it.
     sh1106_cmd(0xAE);                 // display OFF
     sh1106_cmd(0xD5); sh1106_cmd(0x80); // clock divide
     sh1106_cmd(0xA8); sh1106_cmd(0x3F); // multiplex 1/64
@@ -355,6 +369,8 @@ bool display_init(int sda_gpio, int scl_gpio, int i2c_addr_7bit) {
     ESP_LOGI(DLTAG, "SH1106 init done, drew initial screen");
 
     // Start updater task
+    // This will run a background task to update the display when new lines are added.
+    // Via the flag s_dirty.
     xTaskCreate(display_task, "display_task", 2048, NULL, 4, NULL);
 
     return true;
