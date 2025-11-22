@@ -16,7 +16,7 @@ if(NOT CMAKE_SCRIPT_MODE_FILE)
     )
 endif()
 
-idf_component_register(SRCS "u8g2_esp32_hal.c" "app_main.c" "${EMBEDDED_HTML_C}" "display_log.c"
+idf_component_register(SRCS "dht11.c" "u8g2_esp32_hal.c" "app_main.c" "${EMBEDDED_HTML_C}" "display_log.c"
                     PRIV_REQUIRES mqtt nvs_flash esp_netif esp_wifi wifi_provisioning esp_http_server
                     INCLUDE_DIRS "."
                     REQUIRES driver esp_lcd)

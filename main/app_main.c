@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "dht11.h"
 #include "display_log.h"
 
 /* Wi-Fi Provisioning */
@@ -701,6 +702,19 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
                     gpio_set_level((gpio_num_t)gpio_num, 1);
                 }
                 send_a_message(client, "GPIO is now ON");
+
+            ESP_LOGI(TAG, "DHT11 command received");
+            int temperature = 0;
+            int humidity = 0;
+            esp_err_t ret = dht11_read(3, &temperature, &humidity); // Assuming GPIO3 is used for DHT11
+            char dht_response[64];
+            if (ret == ESP_OK) {
+                snprintf(dht_response, sizeof(dht_response), "{\"temperature\":%d,\"humidity\":%d}", temperature, humidity);
+            } else {
+                snprintf(dht_response, sizeof(dht_response), "{\"error\":\"Failed to read DHT11 sensor\"}, error: %d", ret);
+            }
+            send_a_message(client, dht_response);
+
             } else if (span_contains(event->topic, event->topic_len, "OFF", 3)) {
                 ESP_LOGI(TAG, "GPIO set to OFF");
                 gpio_set_level((gpio_num_t)gpio_num, 0);
@@ -710,6 +724,18 @@ static void mqtt5_event_handler(void *handler_args, esp_event_base_t base, int32
             }
 
             
+        } else if (span_contains(event->topic, event->topic_len, "/command/dht11", 14)) {
+            ESP_LOGI(TAG, "DHT11 command received");
+            int temperature = 0;
+            int humidity = 0;
+            esp_err_t ret = dht11_read(3, &temperature, &humidity); // Assuming GPIO3 is used for DHT11
+            char dht_response[64];
+            if (ret == ESP_OK) {
+                snprintf(dht_response, sizeof(dht_response), "{\"temperature\":%d,\"humidity\":%d}", temperature, humidity);
+            } else {
+                snprintf(dht_response, sizeof(dht_response), "{\"error\":\"Failed to read DHT11 sensor\"}");
+            }
+            send_a_message(client, dht_response);
         }
         
 
@@ -864,8 +890,8 @@ void app_main(void)
 {
     InitLogs();
     InitNVS();
-    // Initialize OLED (defaults GPIO21 SDA, GPIO22 SCL, addr 0x3C)
-    display_init(OLED_DEFAULT_SDA, OLED_DEFAULT_SCL, OLED_DEFAULT_ADDR);
+    // Initialize OLED (defaults GPIO21 SDA, GPIO22 SCL, addr 0x3C) But display disabled for this example
+    display_init(OLED_DEFAULT_SDA, OLED_DEFAULT_SCL, OLED_DEFAULT_ADDR); 
     InitWiFi();
 
     /* Start reset button monitor task */

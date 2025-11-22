@@ -8,8 +8,8 @@ extern "C" {
 #endif
 
 // Default pins for ESP32 DevKit (can be changed in display_init params)
-#define OLED_DEFAULT_SDA 21
-#define OLED_DEFAULT_SCL 22
+#define OLED_DEFAULT_SDA 4
+#define OLED_DEFAULT_SCL 15
 #define OLED_DEFAULT_ADDR 0x3C
 
 // Initialize the OLED display and start a small refresh task.
