@@ -20,6 +20,7 @@ static esp_lcd_panel_io_handle_t s_io = NULL;
 static esp_lcd_panel_handle_t s_panel = NULL; // unused for SH1106 path
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
+static display_controller_t s_controller = DISPLAY_CTRL_SH1106;
 
 #define MAX_LINES 4
 #define MAX_CHARS 21
@@ -156,30 +157,27 @@ static void fb_draw_str(uint8_t *fb, int x, int y, const char *s) {
     }
 }
 
-// ---------------- SH1106 low-level helpers ----------------
+// ---------------- OLED low-level helpers ----------------
 // SH1106 has 132x64 GDDRAM, visible 128 columns start at +2 offset.
 #define SH1106_COL_OFFSET 0      // Common modules need +2. If you see left-edge noise, try 0 or 2.
 #define SH1106_COL_TOTAL 132     // SH1106 GDDRAM columns
 
-static inline void sh1106_cmd(uint8_t cmd) {
-    uint8_t buf[2] = {0x00, cmd}; // control=0x00 (command) It marks the next byte as a command
+static inline void oled_cmd(uint8_t cmd) {
+    uint8_t buf[2] = {0x00, cmd}; // control=0x00 (command) marks next byte as command
     (void)i2c_master_transmit(s_dev, buf, sizeof(buf), 50);
 }
 
-// Set SH1106 page and column address
-// Page is the 8-pixel high row (0..7), col is 0..127 visible area
-// One page length is used for a row of 8 vertical pixels, so you can write lines of text.
-static inline void sh1106_set_page_col(int page, int col) {
-    // Set page address (0xB0..0xB7)
-    sh1106_cmd(0xB0 | (page & 0x0F));
-    int c = col + SH1106_COL_OFFSET;
-    // Many SH1106 sequences set higher nibble first, then lower
-    sh1106_cmd(0x10 | ((c >> 4) & 0x0F));    // higher col
-    sh1106_cmd(0x00 | (c & 0x0F));           // lower col
+// Set OLED page and column address (page = 0..7, column = 0..127)
+static inline void oled_set_page_col(int page, int col) {
+    oled_cmd(0xB0 | (page & 0x0F));
+    int col_offset = (s_controller == DISPLAY_CTRL_SH1106) ? SH1106_COL_OFFSET : 0;
+    int c = col + col_offset;
+    oled_cmd(0x10 | ((c >> 4) & 0x0F));    // higher col bits
+    oled_cmd(0x00 | (c & 0x0F));           // lower col bits
 }
 
-// Transmit data bytes to SH1106
-static inline void sh1106_tx_data(const void *data, size_t len) {
+// Transmit data bytes to OLED
+static inline void oled_tx_data(const void *data, size_t len) {
     // Chunk data with 0x40 control prefix (data)
     const uint8_t *p = (const uint8_t *)data;
     const size_t chunk = 16; // conservative chunk size
@@ -198,32 +196,77 @@ static inline void sh1106_tx_data(const void *data, size_t len) {
 static void sh1106_draw_full(const uint8_t *fb) {
     static const uint8_t zeros8[8] = {0};
     for (int page = 0; page < 8; ++page) {
-        // Position to start of GDDRAM (column 0)
-        sh1106_set_page_col(page, 0);
+        oled_set_page_col(page, 0);
 
-        // Left margin: clear columns before visible area
-        // This is to ensure we don't have any garbage data on the display
         int left = SH1106_COL_OFFSET;
         while (left > 0) {
             size_t n = left > (int)sizeof(zeros8) ? sizeof(zeros8) : (size_t)left;
-            sh1106_tx_data(zeros8, n);
+            oled_tx_data(zeros8, n);
             left -= (int)n;
         }
 
-        // Visible 128 columns from framebuffer
-        // Sends 128 bytes from fb for this page
         const uint8_t *row = &fb[page * 128];
-        sh1106_tx_data(row, 128);
+        oled_tx_data(row, 128);
 
-        // Right margin: clear any remaining columns to end of GDDRAM
-        // This is to ensure we don't have any garbage data on the display
         int right = SH1106_COL_TOTAL - (SH1106_COL_OFFSET + 128);
         while (right > 0) {
             size_t n = right > (int)sizeof(zeros8) ? sizeof(zeros8) : (size_t)right;
-            sh1106_tx_data(zeros8, n);
+            oled_tx_data(zeros8, n);
             right -= (int)n;
         }
     }
+}
+
+static void ssd1306_draw_full(const uint8_t *fb) {
+    for (int page = 0; page < 8; ++page) {
+        oled_set_page_col(page, 0);
+        const uint8_t *row = &fb[page * 128];
+        oled_tx_data(row, 128);
+    }
+}
+
+static void oled_draw_full(const uint8_t *fb) {
+    if (s_controller == DISPLAY_CTRL_SH1106) {
+        sh1106_draw_full(fb);
+    } else {
+        ssd1306_draw_full(fb);
+    }
+}
+
+static void sh1106_init_sequence(void) {
+    oled_cmd(0xAE);                 // display OFF
+    oled_cmd(0xD5); oled_cmd(0x80); // clock divide
+    oled_cmd(0xA8); oled_cmd(0x3F); // multiplex 1/64
+    oled_cmd(0xD3); oled_cmd(0x00); // display offset
+    oled_cmd(0x40 | 0x00);          // start line 0
+    oled_cmd(0xA1);                 // segment remap (mirror X for common modules)
+    oled_cmd(0xC8);                 // COM scan dec (mirror Y)
+    oled_cmd(0xDA); oled_cmd(0x12); // COM pins config
+    oled_cmd(0x81); oled_cmd(0x7F); // contrast
+    oled_cmd(0xD9); oled_cmd(0x22); // pre-charge
+    oled_cmd(0xDB); oled_cmd(0x35); // VCOMH
+    oled_cmd(0xA4);                 // resume to RAM
+    oled_cmd(0xA6);                 // normal display
+    oled_cmd(0xAF);                 // display ON
+}
+
+static void ssd1306_init_sequence(void) {
+    oled_cmd(0xAE);                 // display OFF
+    oled_cmd(0xD5); oled_cmd(0x80); // display clock
+    oled_cmd(0xA8); oled_cmd(0x3F); // multiplex ratio 1/64
+    oled_cmd(0xD3); oled_cmd(0x00); // display offset
+    oled_cmd(0x40 | 0x00);          // start line 0
+    oled_cmd(0x8D); oled_cmd(0x14); // charge pump enable
+    oled_cmd(0x20); oled_cmd(0x00); // horizontal addressing
+    oled_cmd(0xA1);                 // segment remap
+    oled_cmd(0xC8);                 // COM scan dec
+    oled_cmd(0xDA); oled_cmd(0x12); // COM pins config for 128x64
+    oled_cmd(0x81); oled_cmd(0x7F); // contrast
+    oled_cmd(0xD9); oled_cmd(0xF1); // pre-charge period
+    oled_cmd(0xDB); oled_cmd(0x40); // VCOMH deselect
+    oled_cmd(0xA4);                 // resume to RAM
+    oled_cmd(0xA6);                 // normal (not inverted)
+    oled_cmd(0xAF);                 // display ON
 }
 
 // Draw all the lines from s_lines[] to the display
@@ -236,7 +279,7 @@ static void draw_all(void) {
         int y = 16 * i; // line spacing
         if (s_lines[idx][0] != '\0') fb_draw_str(fb, 0, y, s_lines[idx]);
     }
-    sh1106_draw_full(fb);
+    oled_draw_full(fb);
 }
 
 static void display_task(void *arg) {
@@ -266,7 +309,11 @@ static void push_line(const char *text) {
     xSemaphoreGive(s_mutex);
 }
 
-bool display_init(int sda_gpio, int scl_gpio, int i2c_addr_7bit) {
+bool display_init_with_controller(int sda_gpio,
+                                  int scl_gpio,
+                                  int i2c_addr_7bit,
+                                  display_controller_t controller) {
+    s_controller = controller;
     // Init ring buffer
     for (int i = 0; i < MAX_LINES; ++i) {
         s_lines[i][0] = '\0';
@@ -332,30 +379,17 @@ bool display_init(int sda_gpio, int scl_gpio, int i2c_addr_7bit) {
         return false;
     }
 
-    // --------- SH1106 init sequence (page addressing) ---------
-    // This is to initialize the SH1106 controller in page addressing mode.
-    // The register on the oled panel might not be aligned with what we have in the driver.
-    // So we sync all the settings here before using it.
-    sh1106_cmd(0xAE);                 // display OFF
-    sh1106_cmd(0xD5); sh1106_cmd(0x80); // clock divide
-    sh1106_cmd(0xA8); sh1106_cmd(0x3F); // multiplex 1/64
-    sh1106_cmd(0xD3); sh1106_cmd(0x00); // display offset
-    sh1106_cmd(0x40 | 0x00);          // start line 0
-    sh1106_cmd(0xA1);                 // segment remap (mirror X for common modules)
-    sh1106_cmd(0xC8);                 // COM scan dec (mirror Y)
-    sh1106_cmd(0xDA); sh1106_cmd(0x12); // COM pins config
-    sh1106_cmd(0x81); sh1106_cmd(0x7F); // contrast
-    sh1106_cmd(0xD9); sh1106_cmd(0x22); // pre-charge
-    sh1106_cmd(0xDB); sh1106_cmd(0x35); // VCOMH
-    sh1106_cmd(0xA4);                 // resume to RAM
-    sh1106_cmd(0xA6);                 // normal display
-    sh1106_cmd(0xAF);                 // display ON
+    if (s_controller == DISPLAY_CTRL_SH1106) {
+        sh1106_init_sequence();
+    } else {
+        ssd1306_init_sequence();
+    }
 
     // White splash by writing GDDRAM
     {
         static uint8_t fbw[128 * 64 / 8];
         memset(fbw, 0xFF, sizeof(fbw));
-        sh1106_draw_full(fbw);
+        oled_draw_full(fbw);
     }
     // Keep the white screen visible a bit before first text
     vTaskDelay(pdMS_TO_TICKS(300));
@@ -366,7 +400,8 @@ bool display_init(int sda_gpio, int scl_gpio, int i2c_addr_7bit) {
     strncpy(s_lines[0], "Booting...", MAX_CHARS);
     s_head = 1;
     draw_all();
-    ESP_LOGI(DLTAG, "SH1106 init done, drew initial screen");
+    ESP_LOGI(DLTAG, "%s init done, drew initial screen",
+             (s_controller == DISPLAY_CTRL_SH1106) ? "SH1106" : "SSD1306");
 
     // Start updater task
     // This will run a background task to update the display when new lines are added.
@@ -374,6 +409,10 @@ bool display_init(int sda_gpio, int scl_gpio, int i2c_addr_7bit) {
     xTaskCreate(display_task, "display_task", 2048, NULL, 4, NULL);
 
     return true;
+}
+
+bool display_init(int sda_gpio, int scl_gpio, int i2c_addr_7bit) {
+    return display_init_with_controller(sda_gpio, scl_gpio, i2c_addr_7bit, DISPLAY_CTRL_SSD1306);
 }
 
 void display_println(const char *line) {

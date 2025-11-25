@@ -26,7 +26,9 @@ Wiring (defaults):
 
 Notes:
 
-- Default I2C address is 0x3C. If your module uses 0x3D, change the call to `display_init()` in `main/app_main.c` accordingly.
+- Default I2C address is 0x3C. If your module uses 0x3D, change the call to `display_init()` (or `display_init_with_controller()`) in `main/app_main.c` accordingly.
+- For SH1106 modules call `display_init()` (defaults to SH1106). For SSD1306 call
+	`display_init_with_controller(..., DISPLAY_CTRL_SSD1306);` so the driver sends the proper init sequence.
 - The display is initialized at startup and will show short status lines like "Booting…", "WiFi: OK", "IP x.x.x.x", "MQTT: OK", and the last received topic.
 
 Build requirements:
