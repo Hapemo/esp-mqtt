@@ -23,6 +23,7 @@
 #include "dht11.h"
 #include "driver/uart.h"
 #include "display_log.h"
+#include "idf-pmsx003.h"
 
 /* Wi-Fi Provisioning */
 #include <wifi_provisioning/manager.h>
@@ -33,6 +34,12 @@ static const char *TAG = "mqtt5_example";
 
 //=============== Configuration Macros ============== //
 #define CLEAR_WIFI_CREDENTIALS_ON_BOOT 0
+
+// For PMS5003 Sensor
+#define PMS_TX_GPIO   GPIO_NUM_16   // PMS -> ESP RX
+#define PMS_RX_GPIO   GPIO_NUM_17   // PMS -> ESP TX
+#define PMS_SET_GPIO  GPIO_NUM_18
+#define PMS_RESET_GPIO GPIO_NUM_19
 
 
 //============== Global Variables ============== //
@@ -886,14 +893,6 @@ void InitNVS() {
 
 //============== End Other Misc Operations ==============
 
-#include "idf-pmsx003.h"
-
-// main/app_main.c (top of file or new header)
-#define PMS_TX_GPIO   GPIO_NUM_16   // PMS -> ESP RX
-#define PMS_RX_GPIO   GPIO_NUM_17   // PMS -> ESP TX
-#define PMS_SET_GPIO  GPIO_NUM_18
-#define PMS_RESET_GPIO GPIO_NUM_19
-
 static void pms_callback(pm_data_t *data) {
     ESP_LOGI(TAG, "[sensor %d] PM1.0=%u ug/m3", data->sensor_id, data->pm1_0);
     ESP_LOGI(TAG, "[sensor %d] PM2.5=%u ug/m3", data->sensor_id, data->pm2_5);
@@ -904,6 +903,13 @@ static void pms_callback(pm_data_t *data) {
     ESP_LOGI(TAG, "[sensor %d] Particles >2.5um/0.1L: %u", data->sensor_id, data->particles_25um);
     ESP_LOGI(TAG, "[sensor %d] Particles >5.0um/0.1L: %u", data->sensor_id, data->particles_50um);
     ESP_LOGI(TAG, "[sensor %d] Particles >10um/0.1L: %u", data->sensor_id, data->particles_100um);
+
+    // print PM1.0 with display_println
+    static int counter = 0;
+    display_printf("PMS5003 Readings %d", ++counter);
+    display_printf("PM1.0: %u ug/m3", data->pm1_0);
+    display_printf("PM2.5: %u ug/m3", data->pm2_5);
+    display_printf("PM10: %u ug/m3", data->pm10);
 }
 
 void app_main(void)
