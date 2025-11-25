@@ -21,6 +21,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "dht11.h"
+#include "driver/uart.h"
 #include "display_log.h"
 
 /* Wi-Fi Provisioning */
@@ -885,17 +886,53 @@ void InitNVS() {
 
 //============== End Other Misc Operations ==============
 
+#include "idf-pmsx003.h"
+
+// main/app_main.c (top of file or new header)
+#define PMS_TX_GPIO   GPIO_NUM_16   // PMS -> ESP RX
+#define PMS_RX_GPIO   GPIO_NUM_17   // PMS -> ESP TX
+#define PMS_SET_GPIO  GPIO_NUM_18
+#define PMS_RESET_GPIO GPIO_NUM_19
+
+static void pms_callback(pm_data_t *data) {
+    ESP_LOGI(TAG, "[sensor %d] PM1.0=%u ug/m3", data->sensor_id, data->pm1_0);
+    ESP_LOGI(TAG, "[sensor %d] PM2.5=%u ug/m3", data->sensor_id, data->pm2_5);
+    ESP_LOGI(TAG, "[sensor %d] PM10=%u ug/m3", data->sensor_id, data->pm10);
+    ESP_LOGI(TAG, "[sensor %d] Particles >0.3um/0.1L: %u", data->sensor_id, data->particles_03um);
+    ESP_LOGI(TAG, "[sensor %d] Particles >0.5um/0.1L: %u", data->sensor_id, data->particles_05um);
+    ESP_LOGI(TAG, "[sensor %d] Particles >1.0um/0.1L: %u", data->sensor_id, data->particles_10um);
+    ESP_LOGI(TAG, "[sensor %d] Particles >2.5um/0.1L: %u", data->sensor_id, data->particles_25um);
+    ESP_LOGI(TAG, "[sensor %d] Particles >5.0um/0.1L: %u", data->sensor_id, data->particles_50um);
+    ESP_LOGI(TAG, "[sensor %d] Particles >10um/0.1L: %u", data->sensor_id, data->particles_100um);
+}
 
 void app_main(void)
 {
     InitLogs();
     InitNVS();
-    // Initialize OLED (defaults GPIO21 SDA, GPIO22 SCL, addr 0x3C) But display disabled for this example
-    display_init(OLED_DEFAULT_SDA, OLED_DEFAULT_SCL, OLED_DEFAULT_ADDR); 
+
+    pmsx003_config_t conf = {
+        .sensor_id = 1,
+        .uart_port = UART_NUM_1,
+        .indoor = false,
+        .enabled = true,
+        .periodic = true,
+        .periodic_sec_interval = 3,
+        .callback = pms_callback,
+        .set_pin = PMS_SET_GPIO,
+        .reset_pin = PMS_RESET_GPIO,
+        .uart_tx_pin = PMS_TX_GPIO,
+        .uart_rx_pin = PMS_RX_GPIO,
+    };
+    ESP_ERROR_CHECK(idf_pmsx5003_init(&conf));
+
+    // Initialize OLED (defaults GPIO21 SDA, GPIO22 SCL, addr 0x3C)
+    display_init(OLED_DEFAULT_SDA, OLED_DEFAULT_SCL, OLED_DEFAULT_ADDR);
     InitWiFi();
 
     /* Start reset button monitor task */
     xTaskCreate(reset_button_task, "reset_button", 2048, NULL, 5, NULL);
+    
 
     /* Wait for Wi-Fi connection before starting MQTT */
     ESP_LOGI(TAG, "Waiting for Wi-Fi connection...");
